@@ -3,14 +3,36 @@ import javax.swing.*;
 import javax.swing.border.EmptyBorder;
 import java.awt.AWTException;
 import java.awt.BorderLayout;
+import java.awt.CheckboxMenuItem;
+import java.awt.Color;
 import java.awt.Dimension;
 import java.awt.FlowLayout;
 import java.awt.Font;
+import java.awt.Graphics2D;
 import java.awt.GridLayout;
+import java.awt.Image;
+import java.awt.MenuItem;
+import java.awt.PopupMenu;
+import java.awt.RenderingHints;
 import java.awt.Robot;
+import java.awt.SystemTray;
+import java.awt.TrayIcon;
 import java.awt.event.KeyEvent;
+import java.awt.image.BufferedImage;
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
+import java.util.Map;
+import java.util.Set;
 
+/**
+ * NfcWedge - reads the UID of any PC/SC contactless reader and types it
+ * as keyboard input. Runs in the system tray when the window is closed.
+ *
+ * Run with:  java --add-opens java.smartcardio/sun.security.smartcardio=ALL-UNNAMED NfcWedge
+ * Start hidden in the tray:  ... NfcWedge --minimized
+ */
 public class NfcWedge {
 
     private static final byte[] GET_UID_APDU = {
@@ -18,9 +40,13 @@ public class NfcWedge {
     };
 
     private static final long COOLDOWN_MS = 2000;
-    private static final long WAIT_TIMEOUT_MS = 1000;
+    private static final long POLL_MS = 150;
     private static final boolean SEND_ENTER = true;
-    private static final String READER_NAME_FILTER = "ACR1552";
+
+    // Readers whose names contain any of these (case-insensitive) are ignored.
+    private static final String[] EXCLUDED_NAME_PARTS = {
+        "WINDOWS HELLO", "VIRTUAL", "REMOTE"
+    };
 
     private static JFrame frame;
     private static JLabel connectionStatusLabel;
@@ -30,7 +56,12 @@ public class NfcWedge {
     private static JLabel errorLabel;
     private static JButton exitButton;
 
+    private static TrayIcon trayIcon;
+    private static Image iconIdle;
+    private static Image iconActive;
+
     private static volatile boolean running = true;
+    private static volatile boolean typingEnabled = true;
 
     private static Robot robot;
     private static String lastUid = null;
@@ -38,7 +69,10 @@ public class NfcWedge {
 
     public static void main(String[] args) {
 
-        SwingUtilities.invokeLater(NfcWedge::createUI);
+        final boolean startMinimized =
+            args.length > 0 && "--minimized".equalsIgnoreCase(args[0]);
+
+        SwingUtilities.invokeLater(() -> createUI(startMinimized));
 
         try {
             robot = new Robot();
@@ -57,30 +91,38 @@ public class NfcWedge {
         scannerThread.start();
     }
 
-    private static void createUI() {
+    // ------------------------------------------------------------------
+    // UI + tray
+    // ------------------------------------------------------------------
+
+    private static void createUI(boolean startMinimized) {
+
+        iconIdle = createIcon(new Color(150, 150, 150), 64);
+        iconActive = createIcon(new Color(40, 167, 69), 64);
 
         frame = new JFrame("NfcWedge");
+        frame.setIconImage(iconIdle);
 
         frame.setDefaultCloseOperation(JFrame.DO_NOTHING_ON_CLOSE);
-        frame.setSize(420, 330);
-        frame.setMinimumSize(new Dimension(380, 300));
+        frame.setSize(420, 350);
+        frame.setMinimumSize(new Dimension(380, 320));
         frame.setLocationRelativeTo(null);
 
         frame.addWindowListener(new java.awt.event.WindowAdapter() {
             @Override
             public void windowClosing(java.awt.event.WindowEvent e) {
-                shutdown();
+                hideToTrayOrExit();
             }
         });
 
         JPanel mainPanel = new JPanel(new BorderLayout(10, 10));
         mainPanel.setBorder(new EmptyBorder(15, 15, 15, 15));
 
-        JLabel titleLabel = new JLabel("NfcWedge");
+        JLabel titleLabel = new JLabel("NFC Reader to keyboard input");
         titleLabel.setFont(new Font("SansSerif", Font.BOLD, 22));
 
         JLabel subtitleLabel = new JLabel(
-            "NFC reader → keyboard input"
+            "https://github.com/estelsnt/nfc-scanwedge-windows.git"
         );
 
         JPanel titlePanel = new JPanel();
@@ -101,20 +143,11 @@ public class NfcWedge {
             BorderFactory.createTitledBorder("Status")
         );
 
-        connectionStatusLabel =
-            createStatusLabel("Reader disconnected");
-
-        readerNameLabel =
-            createStatusLabel("Reader: -");
-
-        statusLabel =
-            createStatusLabel("Status: Starting...");
-
-        lastUidLabel =
-            createStatusLabel("Last scan: -");
-
-        errorLabel =
-            createStatusLabel("Error: -");
+        connectionStatusLabel = createStatusLabel("Reader disconnected");
+        readerNameLabel = createStatusLabel("Reader: -");
+        statusLabel = createStatusLabel("Status: Starting...");
+        lastUidLabel = createStatusLabel("Last scan: -");
+        errorLabel = createStatusLabel("Error: -");
 
         statusPanel.add(connectionStatusLabel);
         statusPanel.add(readerNameLabel);
@@ -128,15 +161,133 @@ public class NfcWedge {
             new FlowLayout(FlowLayout.RIGHT)
         );
 
+        boolean trayReady = setupTray();
+
+        if (trayReady) {
+            JButton hideButton = new JButton("Hide to tray");
+            hideButton.addActionListener(e -> frame.setVisible(false));
+            buttonPanel.add(hideButton);
+        }
+
         exitButton = new JButton("Exit");
         exitButton.addActionListener(e -> shutdown());
-
         buttonPanel.add(exitButton);
 
         mainPanel.add(buttonPanel, BorderLayout.SOUTH);
 
         frame.setContentPane(mainPanel);
-        frame.setVisible(true);
+
+        // Only start hidden if the tray is actually available.
+        frame.setVisible(!(startMinimized && trayReady));
+    }
+
+    private static boolean setupTray() {
+
+        if (!SystemTray.isSupported()) {
+            return false;
+        }
+
+        try {
+            SystemTray tray = SystemTray.getSystemTray();
+
+            PopupMenu menu = new PopupMenu();
+
+            MenuItem showItem = new MenuItem("Show window");
+            showItem.addActionListener(e -> showWindow());
+
+            CheckboxMenuItem typingItem =
+                new CheckboxMenuItem("Typing enabled", true);
+            typingItem.addItemListener(e -> typingEnabled = typingItem.getState());
+
+            MenuItem exitItem = new MenuItem("Exit");
+            exitItem.addActionListener(e -> shutdown());
+
+            menu.add(showItem);
+            menu.add(typingItem);
+            menu.addSeparator();
+            menu.add(exitItem);
+
+            java.awt.Dimension size = tray.getTrayIconSize();
+            trayIcon = new TrayIcon(
+                createIcon(new Color(150, 150, 150), Math.max(size.width, 16)),
+                "NfcWedge - waiting for reader",
+                menu
+            );
+            trayIcon.setImageAutoSize(true);
+            trayIcon.addActionListener(e -> showWindow()); // double-click
+
+            tray.add(trayIcon);
+            return true;
+
+        } catch (AWTException e) {
+            System.err.println("Could not add tray icon: " + e.getMessage());
+            trayIcon = null;
+            return false;
+        }
+    }
+
+    private static void hideToTrayOrExit() {
+
+        if (trayIcon != null) {
+
+            frame.setVisible(false);
+
+            trayIcon.displayMessage(
+                "NfcWedge",
+                "Still running in the background. Use the tray icon to reopen or exit.",
+                TrayIcon.MessageType.INFO
+            );
+
+        } else {
+            shutdown();
+        }
+    }
+
+    private static void showWindow() {
+
+        SwingUtilities.invokeLater(() -> {
+
+            if (frame == null) {
+                return;
+            }
+
+            frame.setVisible(true);
+            frame.setExtendedState(JFrame.NORMAL);
+            frame.toFront();
+            frame.requestFocus();
+        });
+    }
+
+    private static Image createIcon(Color color, int size) {
+
+        BufferedImage img =
+            new BufferedImage(size, size, BufferedImage.TYPE_INT_ARGB);
+
+        Graphics2D g = img.createGraphics();
+
+        g.setRenderingHint(
+            RenderingHints.KEY_ANTIALIASING,
+            RenderingHints.VALUE_ANTIALIAS_ON
+        );
+
+        int pad = Math.max(1, size / 8);
+
+        g.setColor(color);
+        g.fillOval(pad, pad, size - pad * 2, size - pad * 2);
+
+        g.setColor(Color.WHITE);
+        g.setStroke(new java.awt.BasicStroke(Math.max(1f, size / 12f)));
+
+        int c = size / 2;
+        int r1 = size / 6;
+        int r2 = size / 3;
+
+        g.drawArc(c - r1, c - r1, r1 * 2, r1 * 2, -45, 90);
+        g.drawArc(c - r2, c - r2, r2 * 2, r2 * 2, -45, 90);
+
+        g.dispose();
+
+        return img;
     }
 
     private static JLabel createStatusLabel(String text) {
@@ -150,121 +301,93 @@ public class NfcWedge {
         return label;
     }
 
+    // ------------------------------------------------------------------
+    // Scanner
+    // ------------------------------------------------------------------
+
     private static void scannerLoop() {
 
-        TerminalFactory factory =
-            TerminalFactory.getDefault();
+        TerminalFactory factory = TerminalFactory.getDefault();
 
-        updateStatus(
-            "Looking for " + READER_NAME_FILTER + "...",
-            false
-        );
+        Map<String, Boolean> cardPresent = new HashMap<>();
+        String lastReaderSummary = null;
+        long lastContextReset = 0;
+
+        updateStatus("Looking for readers...", false);
 
         while (running) {
 
             try {
 
-                CardTerminal terminal =
-                    findReader(factory, READER_NAME_FILTER);
+                List<CardTerminal> readers = listReaders(factory);
 
-                if (terminal == null) {
+                if (readers.isEmpty()) {
 
-                    setDisconnected();
+                    if (lastReaderSummary != null || cardPresent.size() > 0) {
+                        setDisconnected();
+                    }
+
+                    lastReaderSummary = null;
+                    cardPresent.clear();
+
+                    // Recover from a stale PC/SC context after replugging.
+                    long now = System.currentTimeMillis();
+
+                    if (now - lastContextReset > 5000) {
+                        resetPcscContext();
+                        lastContextReset = now;
+                    }
 
                     sleep(2000);
-
                     continue;
                 }
 
-                setConnected(terminal.getName());
+                String summary = summarize(readers);
 
-                updateStatus(
-                    "Waiting for card...",
-                    false
-                );
+                if (!summary.equals(lastReaderSummary)) {
 
-                boolean present =
-                    terminal.waitForCardPresent(
-                        WAIT_TIMEOUT_MS
-                    );
+                    setConnected(summary);
 
-                if (!present) {
-                    continue;
+                    updateStatus("Waiting for card...", false);
+
+                    lastReaderSummary = summary;
                 }
 
-                updateStatus(
-                    "Card detected. Reading UID...",
-                    false
-                );
+                Set<String> names = new HashSet<>();
 
-                String uid = readUid(terminal);
+                for (CardTerminal terminal : readers) {
 
-                if (uid == null) {
+                    String name = terminal.getName();
+                    names.add(name);
 
-                    updateStatus(
-                        "Could not read card UID",
-                        true
-                    );
+                    boolean nowPresent;
 
                     try {
-                        terminal.waitForCardAbsent(0);
-                    } catch (CardException ignored) {
+                        nowPresent = terminal.isCardPresent();
+                    } catch (CardException e) {
+
+                        updateError(
+                            "Reader error (" + name + "): " + e.getMessage()
+                        );
+
+                        cardPresent.put(name, false);
+                        continue;
                     }
 
-                    continue;
-                }
+                    boolean wasPresent =
+                        cardPresent.getOrDefault(name, false);
 
-                long now = System.currentTimeMillis();
+                    cardPresent.put(name, nowPresent);
 
-                boolean sameCardStillCoolingDown =
-                    uid.equals(lastUid)
-                    && (now - lastReadTime) < COOLDOWN_MS;
-
-                if (!sameCardStillCoolingDown) {
-
-                    updateLastUid(uid);
-
-                    updateStatus(
-                        "Typing UID...",
-                        false
-                    );
-
-                    typeString(robot, uid);
-
-                    if (SEND_ENTER) {
-                        pressEnter(robot);
+                    // Only act on the moment a card arrives.
+                    if (nowPresent && !wasPresent) {
+                        handleCard(terminal);
                     }
-
-                    lastUid = uid;
-                    lastReadTime = now;
-
-                    updateStatus(
-                        "Scan complete. Waiting for card...",
-                        false
-                    );
                 }
 
-                try {
+                cardPresent.keySet().retainAll(names);
 
-                    terminal.waitForCardAbsent(0);
-
-                } catch (CardException e) {
-
-                    updateError(
-                        "Reader disconnected: "
-                        + e.getMessage()
-                    );
-                }
-
-            } catch (CardException e) {
-
-                setDisconnected();
-
-                updateError(
-                    "Reader error: " + e.getMessage()
-                );
-
-                sleep(1500);
+                sleep(POLL_MS);
 
             } catch (Exception e) {
 
@@ -279,35 +402,138 @@ public class NfcWedge {
         }
     }
 
-    private static CardTerminal findReader(
-        TerminalFactory factory,
-        String nameFilter
-    ) {
+    private static void handleCard(CardTerminal terminal) {
+
+        updateStatus("Card detected. Reading UID...", false);
+
+        String uid = readUid(terminal);
+
+        if (uid == null) {
+
+            updateStatus("Could not read card UID", true);
+            return;
+        }
+
+        long now = System.currentTimeMillis();
+
+        boolean sameCardStillCoolingDown =
+            uid.equals(lastUid)
+            && (now - lastReadTime) < COOLDOWN_MS;
+
+        if (sameCardStillCoolingDown) {
+
+            updateStatus("Scan ignored (cooldown). Waiting for card...", false);
+            return;
+        }
+
+        updateLastUid(uid);
+
+        if (typingEnabled) {
+
+            updateStatus("Typing UID...", false);
+
+            typeString(robot, uid);
+
+            if (SEND_ENTER) {
+                pressEnter(robot);
+            }
+
+            updateStatus("Scan complete. Waiting for card...", false);
+
+        } else {
+
+            updateStatus("Typing paused. Waiting for card...", false);
+        }
+
+        lastUid = uid;
+        lastReadTime = now;
+    }
+
+    /** Lists every usable reader, skipping virtual/excluded ones. */
+    private static List<CardTerminal> listReaders(TerminalFactory factory) {
+
+        List<CardTerminal> result = new ArrayList<>();
 
         try {
 
-            List<CardTerminal> terminals =
-                factory.terminals().list();
+            for (CardTerminal terminal : factory.terminals().list()) {
 
-            for (CardTerminal terminal : terminals) {
-
-                if (terminal.getName()
-                    .toUpperCase()
-                    .contains(nameFilter.toUpperCase())) {
-
-                    return terminal;
+                if (!isExcluded(terminal.getName())) {
+                    result.add(terminal);
                 }
             }
 
         } catch (CardException e) {
-
-            updateError(
-                "Could not list readers: "
-                + e.getMessage()
-            );
+            // "No readers available" is reported as an exception on Windows.
+            // Treat it as an empty list; the loop will retry.
         }
 
-        return null;
+        return result;
+    }
+
+    private static boolean isExcluded(String readerName) {
+
+        String upper = readerName.toUpperCase();
+
+        for (String part : EXCLUDED_NAME_PARTS) {
+
+            if (upper.contains(part)) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    private static String summarize(List<CardTerminal> readers) {
+
+        String first = readers.get(0).getName();
+
+        if (readers.size() == 1) {
+            return first;
+        }
+
+        return first + " (+" + (readers.size() - 1) + " more)";
+    }
+
+    /**
+     * Re-establishes the PC/SC context so readers plugged in after startup
+     * get picked up. Needs:
+     *   --add-opens java.smartcardio/sun.security.smartcardio=ALL-UNNAMED
+     * Fails quietly if that flag is missing.
+     */
+    private static void resetPcscContext() {
+
+        try {
+
+            Class<?> pcscTerminals =
+                Class.forName("sun.security.smartcardio.PCSCTerminals");
+
+            java.lang.reflect.Field contextId =
+                pcscTerminals.getDeclaredField("contextId");
+            contextId.setAccessible(true);
+
+            if (contextId.getLong(pcscTerminals) != 0L) {
+
+                Class<?> pcsc =
+                    Class.forName("sun.security.smartcardio.PCSC");
+
+                java.lang.reflect.Method establish =
+                    pcsc.getDeclaredMethod("SCardEstablishContext", Integer.TYPE);
+                establish.setAccessible(true);
+
+                java.lang.reflect.Field scope =
+                    pcsc.getDeclaredField("SCARD_SCOPE_USER");
+                scope.setAccessible(true);
+
+                long newId =
+                    (Long) establish.invoke(pcsc, scope.getInt(pcsc));
+
+                contextId.setLong(pcscTerminals, newId);
+            }
+
+        } catch (Exception ignored) {
+        }
     }
 
     private static String readUid(
@@ -320,13 +546,10 @@ public class NfcWedge {
 
             card = terminal.connect("*");
 
-            CardChannel channel =
-                card.getBasicChannel();
+            CardChannel channel = card.getBasicChannel();
 
             ResponseAPDU response =
-                channel.transmit(
-                    new CommandAPDU(GET_UID_APDU)
-                );
+                channel.transmit(new CommandAPDU(GET_UID_APDU));
 
             int statusWord = response.getSW();
 
@@ -344,9 +567,7 @@ public class NfcWedge {
 
             if (data.length == 0) {
 
-                updateError(
-                    "Reader returned an empty UID"
-                );
+                updateError("Reader returned an empty UID");
 
                 return null;
             }
@@ -355,10 +576,7 @@ public class NfcWedge {
 
         } catch (CardException e) {
 
-            updateError(
-                "Error reading card: "
-                + e.getMessage()
-            );
+            updateError("Error reading card: " + e.getMessage());
 
             return null;
 
@@ -379,14 +597,15 @@ public class NfcWedge {
         StringBuilder sb = new StringBuilder();
 
         for (byte b : bytes) {
-
-            sb.append(
-                String.format("%02x", b)
-            );
+            sb.append(String.format("%02x", b));
         }
 
         return sb.toString();
     }
+
+    // ------------------------------------------------------------------
+    // Keyboard output
+    // ------------------------------------------------------------------
 
     private static void typeString(
         Robot robot,
@@ -407,18 +626,15 @@ public class NfcWedge {
 
         if (c >= '0' && c <= '9') {
 
-            keyCode =
-                KeyEvent.VK_0 + (c - '0');
+            keyCode = KeyEvent.VK_0 + (c - '0');
 
         } else if (c >= 'a' && c <= 'z') {
 
-            keyCode =
-                KeyEvent.VK_A + (c - 'a');
+            keyCode = KeyEvent.VK_A + (c - 'a');
 
         } else if (c >= 'A' && c <= 'Z') {
 
-            keyCode =
-                KeyEvent.VK_A + (c - 'A');
+            keyCode = KeyEvent.VK_A + (c - 'A');
 
         } else {
 
@@ -437,6 +653,10 @@ public class NfcWedge {
         robot.keyRelease(KeyEvent.VK_ENTER);
     }
 
+    // ------------------------------------------------------------------
+    // Status helpers
+    // ------------------------------------------------------------------
+
     private static void setConnected(
         String readerName
     ) {
@@ -444,17 +664,16 @@ public class NfcWedge {
         SwingUtilities.invokeLater(() -> {
 
             if (connectionStatusLabel != null) {
-
-                connectionStatusLabel.setText(
-                    "Reader connected"
-                );
+                connectionStatusLabel.setText("Reader connected");
             }
 
             if (readerNameLabel != null) {
+                readerNameLabel.setText("Reader: " + readerName);
+            }
 
-                readerNameLabel.setText(
-                    "Reader: " + readerName
-                );
+            if (trayIcon != null) {
+                trayIcon.setImage(iconActive);
+                trayIcon.setToolTip("NfcWedge - " + readerName);
             }
         });
     }
@@ -464,24 +683,20 @@ public class NfcWedge {
         SwingUtilities.invokeLater(() -> {
 
             if (connectionStatusLabel != null) {
-
-                connectionStatusLabel.setText(
-                    "Reader disconnected"
-                );
+                connectionStatusLabel.setText("Reader disconnected");
             }
 
             if (readerNameLabel != null) {
-
-                readerNameLabel.setText(
-                    "Reader: -"
-                );
+                readerNameLabel.setText("Reader: -");
             }
 
             if (statusLabel != null) {
+                statusLabel.setText("Status: Waiting for reader...");
+            }
 
-                statusLabel.setText(
-                    "Status: Waiting for reader..."
-                );
+            if (trayIcon != null) {
+                trayIcon.setImage(iconIdle);
+                trayIcon.setToolTip("NfcWedge - waiting for reader");
             }
         });
     }
@@ -494,17 +709,11 @@ public class NfcWedge {
         SwingUtilities.invokeLater(() -> {
 
             if (statusLabel != null) {
-
-                statusLabel.setText(
-                    "Status: " + message
-                );
+                statusLabel.setText("Status: " + message);
             }
 
             if (!error && errorLabel != null) {
-
-                errorLabel.setText(
-                    "Error: -"
-                );
+                errorLabel.setText("Error: -");
             }
         });
     }
@@ -518,10 +727,7 @@ public class NfcWedge {
         SwingUtilities.invokeLater(() -> {
 
             if (errorLabel != null) {
-
-                errorLabel.setText(
-                    "Error: " + message
-                );
+                errorLabel.setText("Error: " + message);
             }
         });
     }
@@ -533,10 +739,7 @@ public class NfcWedge {
         SwingUtilities.invokeLater(() -> {
 
             if (lastUidLabel != null) {
-
-                lastUidLabel.setText(
-                    "Last scan: " + uid
-                );
+                lastUidLabel.setText("Last scan: " + uid);
             }
         });
     }
@@ -560,22 +763,26 @@ public class NfcWedge {
 
         running = false;
 
-        if (exitButton != null) {
-            exitButton.setEnabled(false);
-        }
+        SwingUtilities.invokeLater(() -> {
 
-        if (statusLabel != null) {
+            if (exitButton != null) {
+                exitButton.setEnabled(false);
+            }
 
-            statusLabel.setText(
-                "Status: Shutting down..."
-            );
-        }
+            if (statusLabel != null) {
+                statusLabel.setText("Status: Shutting down...");
+            }
+        });
 
         new Thread(() -> {
 
             sleep(300);
 
             SwingUtilities.invokeLater(() -> {
+
+                if (trayIcon != null) {
+                    SystemTray.getSystemTray().remove(trayIcon);
+                }
 
                 if (frame != null) {
                     frame.dispose();
