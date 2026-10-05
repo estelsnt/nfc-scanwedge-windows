@@ -30,6 +30,9 @@ import java.util.Set;
  * NfcWedge - reads the UID of any PC/SC contactless reader and types it
  * as keyboard input. Runs in the system tray when the window is closed.
  *
+ * Output format can be switched between decimal (default) and hexadecimal
+ * from the window dropdown or the tray menu.
+ *
  * Run with:  java --add-opens java.smartcardio/sun.security.smartcardio=ALL-UNNAMED NfcWedge
  * Start hidden in the tray:  ... NfcWedge --minimized
  */
@@ -43,6 +46,10 @@ public class NfcWedge {
     private static final long POLL_MS = 150;
     private static final boolean SEND_ENTER = true;
 
+    // true  = reverse the bytes (little-endian) before formatting
+    // false = use the bytes in the order the reader reports them (big-endian)
+    private static final boolean REVERSE_BYTES = false;
+
     // Readers whose names contain any of these (case-insensitive) are ignored.
     private static final String[] EXCLUDED_NAME_PARTS = {
         "WINDOWS HELLO", "VIRTUAL", "REMOTE"
@@ -55,13 +62,16 @@ public class NfcWedge {
     private static JLabel lastUidLabel;
     private static JLabel errorLabel;
     private static JButton exitButton;
+    private static JComboBox<String> formatBox;
 
     private static TrayIcon trayIcon;
+    private static CheckboxMenuItem decimalItem;
     private static Image iconIdle;
     private static Image iconActive;
 
     private static volatile boolean running = true;
     private static volatile boolean typingEnabled = true;
+    private static volatile boolean decimalOutput = true; // default: decimal
 
     private static Robot robot;
     private static String lastUid = null;
@@ -104,8 +114,8 @@ public class NfcWedge {
         frame.setIconImage(iconIdle);
 
         frame.setDefaultCloseOperation(JFrame.DO_NOTHING_ON_CLOSE);
-        frame.setSize(420, 350);
-        frame.setMinimumSize(new Dimension(380, 320));
+        frame.setSize(480, 350);
+        frame.setMinimumSize(new Dimension(440, 320));
         frame.setLocationRelativeTo(null);
 
         frame.addWindowListener(new java.awt.event.WindowAdapter() {
@@ -161,6 +171,15 @@ public class NfcWedge {
             new FlowLayout(FlowLayout.RIGHT)
         );
 
+        formatBox = new JComboBox<>(new String[] { "Decimal", "Hexadecimal" });
+        formatBox.setSelectedItem(decimalOutput ? "Decimal" : "Hexadecimal");
+        formatBox.addActionListener(e ->
+            setDecimalOutput("Decimal".equals(formatBox.getSelectedItem()))
+        );
+
+        buttonPanel.add(new JLabel("UID format:"));
+        buttonPanel.add(formatBox);
+
         boolean trayReady = setupTray();
 
         if (trayReady) {
@@ -199,11 +218,16 @@ public class NfcWedge {
                 new CheckboxMenuItem("Typing enabled", true);
             typingItem.addItemListener(e -> typingEnabled = typingItem.getState());
 
+            decimalItem =
+                new CheckboxMenuItem("Decimal output (off = hex)", decimalOutput);
+            decimalItem.addItemListener(e -> setDecimalOutput(decimalItem.getState()));
+
             MenuItem exitItem = new MenuItem("Exit");
             exitItem.addActionListener(e -> shutdown());
 
             menu.add(showItem);
             menu.add(typingItem);
+            menu.add(decimalItem);
             menu.addSeparator();
             menu.add(exitItem);
 
@@ -572,7 +596,7 @@ public class NfcWedge {
                 return null;
             }
 
-            return bytesToHex(data);
+            return formatUid(data);
 
         } catch (CardException e) {
 
@@ -592,11 +616,27 @@ public class NfcWedge {
         }
     }
 
-    private static String bytesToHex(byte[] bytes) {
+    /** Formats UID bytes as decimal or lowercase hex, per the current toggle. */
+    private static String formatUid(byte[] bytes) {
+
+        byte[] ordered = bytes.clone();
+
+        if (REVERSE_BYTES) {
+            for (int i = 0, j = ordered.length - 1; i < j; i++, j--) {
+                byte tmp = ordered[i];
+                ordered[i] = ordered[j];
+                ordered[j] = tmp;
+            }
+        }
+
+        if (decimalOutput) {
+            // signum = 1 treats the bytes as an unsigned number
+            return new java.math.BigInteger(1, ordered).toString();
+        }
 
         StringBuilder sb = new StringBuilder();
 
-        for (byte b : bytes) {
+        for (byte b : ordered) {
             sb.append(String.format("%02x", b));
         }
 
@@ -656,6 +696,23 @@ public class NfcWedge {
     // ------------------------------------------------------------------
     // Status helpers
     // ------------------------------------------------------------------
+
+    /** Sets the output format and keeps the window dropdown and tray checkbox in sync. */
+    private static void setDecimalOutput(boolean decimal) {
+
+        decimalOutput = decimal;
+
+        SwingUtilities.invokeLater(() -> {
+
+            if (formatBox != null) {
+                formatBox.setSelectedItem(decimal ? "Decimal" : "Hexadecimal");
+            }
+
+            if (decimalItem != null) {
+                decimalItem.setState(decimal);
+            }
+        });
+    }
 
     private static void setConnected(
         String readerName
