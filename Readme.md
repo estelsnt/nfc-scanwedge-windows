@@ -2,18 +2,15 @@
 
 Turns a PC/SC contactless reader (e.g. ACS ACR1552U) into a keyboard-wedge
 scanner: tap a card, and its UID gets typed into whatever window/textbox
-currently has focus, followed by Enter — just like a barcode scanner.
+currently has focus, followed by Enter.
 
 Uses only standard JDK classes (`javax.smartcardio` for the reader,
 `java.awt.Robot` for keystroke injection) — no external dependencies.
 
 ## Requirements
 
-- JDK 11+ (jpackage for the .exe step requires JDK 14+)
-- The reader's PC/SC driver installed (you already have this — the beep
-  you're hearing confirms the driver works)
-- Windows Smart Card service running (it usually starts automatically
-  once a PC/SC reader driver is installed)
+- JDK 11+
+- The reader's PC/SC driver installed
 
 ## Run it directly
 
@@ -22,7 +19,7 @@ javac NfcWedge.java
 java NfcWedge
 ```
 
-Tap a card on the reader — the UID (hex string) should get typed into
+Tap a card on the reader — the UID (decimal by default, can be changed to hex) should get typed into
 whatever field has focus, then Enter is pressed.
 
 If it can't find your reader, it will print the list of available reader
